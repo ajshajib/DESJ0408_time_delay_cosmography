@@ -1,11 +1,14 @@
 import numpy as np
 import os
 import pickle
-import copy
-import time
-import h5py
-from tqdm import tqdm_notebook, tnrange
 
+from astropy.cosmology import FlatLambdaCDM
+from scipy.stats import gaussian_kde
+from lenstronomy.Cosmo.kde_likelihood import KDELikelihood
+from tqdm import tqdm_notebook, tnrange
+import emcee
+import gc
+from astropy.io import fits
 
 import lenstronomy.Util.util as util
 from lenstronomy.Workflow.fitting_sequence import FittingSequence
@@ -33,25 +36,36 @@ class ModelOutput(object):
 
     VEL_DIS = np.array([230., 236., 220., 227.])
     SIG_VEL_DIS = np.array([37., 42., 21., 9.])
+    INV_COV_MAT = np.linalg.inv(np.diag(SIG_VEL_DIS**2+17**2) + (
+            -1*np.eye(4, 4)+1)*17**2)
     PSF_FWHM = np.array([0.68, 0.76, 0.52, 0.60796])
     MOFFAT_BETA = np.array([2.97, 3.20, 3.06, 1.55])
     SLIT_WIDTH = np.array([1., 1., 0.75, 1.])
     APERTURE_LENGTH = np.array([1., 1., 1., 1.])
 
-    def __init__(self, output_file, model_type, is_test=False):
+
+
+    def __init__(self, model_name, model_type, dir_prefix,
+                 dir_suffix, is_test=False, microlensing=False):
         """
         Load the model output file and load the posterior chain and other model
         speification objects.
         """
-        self.model_id = output_file
+        self.model_id = model_name
         self.model_type = model_type
         self.is_test = is_test
+        self.file_path = dir_prefix + model_name + dir_suffix
+
+        self.microlensing = microlensing
+        if self.microlensing:
+            self.ml_maps = []
+            self.load_microlensing_delays()
 
         # input_temp = os.path.join(base_path, 'temp', job_name_out +'.txt')
         # output_temp = os.path.join(base_path, 'temp', job_name_out
         # +'_out.txt')
 
-        f = open(output_file, 'rb')
+        f = open(self.file_path, 'rb')
         [input_, output_] = pickle.load(f)
         f.close()
         fitting_kwargs_list, kwargs_joint, kwargs_model, kwargs_constraints, kwargs_likelihood, kwargs_params, init_samples = input_
@@ -92,10 +106,11 @@ class ModelOutput(object):
                                  kwargs_params['point_source_model'][2],
                                  kwargs_params['special'][2],
                                  kwargs_params['extinction_model'][2],
-                                 kwargs_lens_init=kwargs_params['lens_model'][
-                                     0],
+                                 kwargs_lens_init=kwargs_params[
+                                     'lens_model'][0],
                                  **kwargs_constraints
-                                 )
+                                )
+
 
         kwargs_result = self.param_class.args2kwargs(self.samples_mcmc[-1])
 
@@ -143,6 +158,12 @@ class ModelOutput(object):
                                        'max_integrate': 100,
                                        'min_integrate': 0.001}
 
+    def cleanup(self):
+        del self.tiled_model_velocity_dispersion
+        del self.tiled_model_time_delays
+
+        gc.collect()
+
     def get_num_samples(self):
         """
         Get the number of samples.
@@ -154,6 +175,7 @@ class ModelOutput(object):
     def get_r_eff(self, i=-1):
         """
         Compute effective radius of the light distribution in F160W band.
+        :param i: index of sample in the mcmc chain
         """
         if i == -1:
             kwargs_result = self.kwargs_result
@@ -272,9 +294,7 @@ class ModelOutput(object):
                 aniso_param = np.random.uniform(aniso_param_min*r_eff,
                                                 aniso_param_max*r_eff)
 
-	        aniso_param = 3.29677517
-            r_eff = 1.14436747
-            self.r_ani.append(aniso_param)
+                self.r_ani.append(aniso_param)
 
             for n in range(len(self.VEL_DIS)):
                 kwargs_result = self.param_class.args2kwargs(sample)
@@ -370,12 +390,6 @@ class ModelOutput(object):
                     lens_model_kinematics_bool=lens_model_bool
                 )
                 vel_dis_array.append(vel_dispersion_temp[0])
-                print(vel_dispersion_temp[0],
-                                 lens_result[0]['gamma'],
-                                 lens_result[0]['theta_E'],
-                                 r_eff,
-                                 aniso_param,
-                      )
 
             self.model_velocity_dispersion.append(vel_dis_array)
 
@@ -384,7 +398,7 @@ class ModelOutput(object):
 
         return self.model_velocity_dispersion
 
-    def populate_Ddt_Dsds(self, Ddt_low=70. / 150., Ddt_high=70. / 30.,
+    def populate_Ddt_Dsds(self, Ddt_low=70./150., Ddt_high=70./30.,
                           Dsds_low=0.1, Dsds_high=2., sample_multiplier=1000):
         """
         :param sample_multiplier: number of uniformly distributed Ddt or
@@ -392,27 +406,36 @@ class ModelOutput(object):
         :return:
         :rtype:
         """
-        self._uniform_Dd_Dsds = np.array([
+        self._uniform_Ddt_Dsds = np.array([
             np.random.uniform(low=Ddt_low, high=Ddt_high,
                               size=self.get_num_samples() * sample_multiplier),
             np.random.uniform(low=Dsds_low, high=Dsds_high,
                               size=self.get_num_samples() * sample_multiplier)
         ])
 
-        self.tiled_model_time_delays = np.array(list(
-            self.model_time_delays) * sample_multiplier)
+        #self.tiled_model_time_delays = np.array(list(
+        #    self.model_time_delays) * sample_multiplier)
 
-        self.tiled_model_velocity_dispersion = np.array(list(
-            self.model_velocity_dispersion) * sample_multiplier)
+        #self.tiled_model_velocity_dispersion = np.array(list(
+        #    self.model_velocity_dispersion) * sample_multiplier)
+
+        self.tiled_model_time_delays = np.tile(self.model_time_delays, 
+                                               [sample_multiplier, 1])
+        self.tiled_model_velocity_dispersion = np.tile(
+            self.model_velocity_dispersion,
+            [sample_multiplier, 1]
+        )
+        
+        #self.tiled_rani = np.tile(self.r_ani, sample_multiplier)
 
         self._time_delay_likelihoods = self.get_time_delay_likelihood(
             self.tiled_model_time_delays,
-            self._uniform_Dd_Dsds[0])
+            self._uniform_Ddt_Dsds[0])
         self._time_delay_likelihoods -= np.max(self._time_delay_likelihoods)
 
         self._velocity_dispersion_likelihoods = self.get_velocity_dispersion_likelihood(
             self.tiled_model_velocity_dispersion,
-            self._uniform_Dd_Dsds[1])
+            self._uniform_Ddt_Dsds[1])
         self._velocity_dispersion_likelihoods -= np.max(
             self._velocity_dispersion_likelihoods)
 
@@ -428,13 +451,32 @@ class ModelOutput(object):
         weights = np.exp(self._time_delay_likelihoods + \
                          self._velocity_dispersion_likelihoods)
         weights = weights / np.sum(weights)
-        indices = np.random.choice(np.arange(len(self._uniform_Dd_Dsds[0])),
+        indices = np.random.choice(np.arange(len(self._uniform_Ddt_Dsds[0])),
                                    p=weights,
                                    size=num_sample)
-        sample = self._uniform_Dd_Dsds[:, indices]
+        sample = self._uniform_Ddt_Dsds[:, indices]
+        sample[1] = sample[0] / sample[1]
+        
+        return sample, indices #, self. #weights[indices], indices
+        
+    def simple_sample_Ddt_Dd(self, num_sample):
+        """
+        Return simple sampled Ddt-Dd ratios for importance sampling from the combined distribution.
+        :param num_sample:
+        :type num_sample:
+        :return:
+        :rtype:
+        """
+        vd_td_likelihoods = self._time_delay_likelihoods + \
+                         self._velocity_dispersion_likelihoods
+        #weights = weights / np.sum(weights)
+        indices = np.random.choice(np.arange(len(self._uniform_Ddt_Dsds[0])),
+                                   #p=weights,
+                                   size=num_sample)
+        sample = self._uniform_Ddt_Dsds[:, indices]
         sample[1] = sample[0] / sample[1]
 
-        return sample
+        return sample, vd_td_likelihoods[indices]
 
     def sample_Ddt(self, num_sample):
         """
@@ -446,7 +488,7 @@ class ModelOutput(object):
         """
         weights = np.exp(self._time_delay_likelihoods)
         weights = weights / np.sum(weights)
-        sample = np.random.choice(self._uniform_Dd_Dsds[0],
+        sample = np.random.choice(self._uniform_Ddt_Dsds[0],
                                   p=weights,
                                   size=num_sample)
 
@@ -462,11 +504,20 @@ class ModelOutput(object):
         """
         weights = np.exp(self._velocity_dispersion_likelihoods)
         weights = weights / np.sum(weights)
-        sample = np.random.choice(self._uniform_Dd_Dsds[1],
+        sample = np.random.choice(self._uniform_Ddt_Dsds[1],
                                   p=weights,
                                   size=num_sample)
 
         return sample
+
+    def load_microlensing_delays(self):
+        names = ['A', 'B', 'D']
+        for i, name in enumerate(names):
+            ml_map = fits.open(
+                '../data/J0408_microlensing/Img{}/TDmap_1.0R0_incl0.0_pa0.0.fits'.format(
+                    name))[0].data
+
+            self.ml_maps.append(ml_map.flatten())
 
     def get_time_delay_likelihood(self, model_delays, Ddt_ratio):
         """
@@ -479,7 +530,18 @@ class ModelOutput(object):
         :return:
         :rtype:
         """
-        microlensing_delays = 0.
+        if self.microlensing:
+            num = len(model_delays)
+
+            ml_delay_A = np.random.choice(self.ml_maps[0], size=num)
+            ml_delay_B = np.random.choice(self.ml_maps[1], size=num)
+            ml_delay_D = np.random.choice(self.ml_maps[2], size=num)
+
+            microlensing_delays = np.array([ml_delay_A - ml_delay_B,
+                                            ml_delay_A - ml_delay_D
+                                            ]).T
+        else:
+            microlensing_delays = 0.
 
         perturbed_delays = (model_delays + microlensing_delays) * Ddt_ratio[:,
                                                                   np.newaxis]
@@ -497,9 +559,385 @@ class ModelOutput(object):
         :return:
         :rtype:
         """
-        likelihood_array = (model_velocity_dispersion * (np.sqrt(Dsds_ratio)[:,
-                                                         np.newaxis])
-                            - self.VEL_DIS[np.newaxis, :]) ** 2 \
-                           / self.SIG_VEL_DIS ** 2
+        #likelihood_array = (model_velocity_dispersion * (np.sqrt(
+        ## Dsds_ratio)[:,
+        #                                                 np.newaxis])
+        #                    - self.VEL_DIS[np.newaxis, :]) ** 2 \
+        #                   / self.SIG_VEL_DIS ** 2
 
-        return -np.sum(likelihood_array, axis=1) / 2.
+        # likelihood_array = np.matmul((model_velocity_dispersion * np.sqrt(
+        #     Dsds_ratio)[:, np.newaxis] - self.VEL_DIS[np.newaxis, :]),
+        #     np.matmul(
+        #     self.INV_COV_MAT[:, np.newaxis], (model_velocity_dispersion * (np.sqrt(
+        #     Dsds_ratio)[:,np.newaxis]) - self.VEL_DIS[np.newaxis, :])))
+
+        diff_vector = model_velocity_dispersion * (np.sqrt(
+             Dsds_ratio)[:,np.newaxis]) - self.VEL_DIS[np.newaxis, :]
+        print(model_velocity_dispersion.shape, self.VEL_DIS[np.newaxis,
+                                               :].shape)
+        right_matmul = np.einsum('ij,kj->ki', self.INV_COV_MAT, diff_vector)
+        print(right_matmul.shape)
+        #left_matmul = np.einsum('ki,ji->k', diff_vector, right_matmul)
+        left_matmul = np.multiply(diff_vector, right_matmul)
+        print(left_matmul.shape)
+        likelihood_array = -np.sum(left_matmul, axis=1) / 2.
+        print(likelihood_array.shape)
+
+        return likelihood_array #-np.sum(likelihood_array, axis=1) / 2.
+
+    def load_velocity_dispersion(self, model_name, dir_prefix, dir_suffix,
+                                 compute_chunk):
+        """
+        Load saved model velocity dispersions.
+        :param model_name:
+        :type model_name:
+        :param dir_prefix:
+        :type dir_prefix: should include the slash at the end
+        :param dir_suffix: example '_mod_out.txt'
+        :type dir_suffix:
+        :return:
+        :rtype:
+        """
+        loaded_vel_dis = []
+
+        for i in range(self.get_num_samples()/compute_chunk):
+            start_index = i * compute_chunk
+            file_path = dir_prefix+ '{}_'.format(start_index) + \
+                        model_name + dir_suffix
+
+            if loaded_vel_dis == []:
+                loaded_vel_dis = np.loadtxt(file_path)
+                #print(loaded_vel_dis.shape)
+            else:
+                #print(loaded_vel_dis.shape)
+                loaded_vel_dis = np.append(loaded_vel_dis, np.loadtxt(file_path),
+                                          axis=0)
+
+        assert len(loaded_vel_dis) == self.get_num_samples()
+
+        self.model_velocity_dispersion = loaded_vel_dis
+
+    def load_r_ani(self, model_name, dir_prefix, dir_suffix,
+                                 compute_chunk):
+        """
+        Load saved r_ani.
+        :param model_name:
+        :type model_name:
+        :param dir_prefix:
+        :type dir_prefix: should include the slash at the end
+        :param dir_suffix: example '_mod_out.txt'
+        :type dir_suffix:
+        :return:
+        :rtype:
+        """
+        loaded_r_ani = []
+
+        for i in range(self.get_num_samples()/compute_chunk):
+            start_index = i * compute_chunk
+            file_path = dir_prefix+ '{}_'.format(start_index) + \
+                        model_name + dir_suffix
+
+            if loaded_r_ani == []:
+                loaded_r_ani = np.loadtxt(file_path)
+                #print(loaded_vel_dis.shape)
+            else:
+                #print(loaded_r_ani.shape)
+                loaded_r_ani = np.append(loaded_r_ani, np.loadtxt(file_path),
+                                          axis=0)
+
+        assert len(loaded_r_ani) == self.get_num_samples()
+
+        self.r_ani = loaded_r_ani
+
+    def load_time_delays(self, model_name, dir_prefix, dir_suffix):
+        """
+        Load saved time delays.
+        :param model_name:
+        :type model_name:
+        :param dir_prefix:
+        :type dir_prefix:
+        :param dir_suffix:
+        :type dir_suffix:
+        :return:
+        :rtype:
+        """
+        file_path = dir_prefix + model_name + dir_suffix
+
+        loaded_time_delays = np.loadtxt(file_path)
+
+        assert len(loaded_time_delays) == self.get_num_samples()
+
+        self.model_time_delays = loaded_time_delays
+
+
+def get_relative_weights(logZs, sigma_numeric, neighbor_indices=None,
+                         take_std=False, sigma_model=None):
+    """
+
+    :param logZs:
+    :type logZs:
+    :param sigma_numeric:
+    :type sigma_numeric:
+    :param neighbor_indices:
+    :type neighbor_indices:
+    :return:
+    :rtype:
+    """
+
+    if sigma_model is not None:
+        pass
+    elif take_std:
+        sigma_model = np.std(logZs)
+    elif neighbor_indices is not None:
+        dlogZ_neighbors = []
+        for ni in neighbor_indices:
+            dlogZ_neighbors.append(abs(logZs[ni[0] - 1] - logZs[ni[1] - 1]))
+
+        sigma_model = np.std(dlogZ_neighbors)
+    else:
+        raise ValueError("Don't know what to do with sigma_model")
+
+    print("sigma_mmodel:", sigma_model)
+    max_logZ = np.max(logZs)
+    # print(max_logZ)
+    del_logZs = logZs - max_logZ
+
+    sigma = np.sqrt(sigma_model ** 2 + sigma_numeric ** 2)
+
+    effective_nums = []
+
+    for dlogZ in del_logZs:
+        distribution = np.random.normal(loc=dlogZ, scale=sigma, size=1000000)
+
+        effective_num = float(len(distribution[distribution >= 0.]))
+
+        effective_num += np.sum(np.exp(distribution[distribution < 0.]))
+
+        effective_nums.append(effective_num / 1000000.)
+
+    return effective_nums / np.max(effective_nums)
+
+
+class CombinedModels(ModelOutput):
+    """
+
+    """
+    def __init__(self, microlensing=False):
+        self.model_id = "combined"
+        #self.model_type = model_type
+        #self.is_test = is_test
+        #self.file_path = dir_prefix + model_name + dir_suffix
+
+        # input_temp = os.path.join(base_path, 'temp', job_name_out +'.txt')
+        # output_temp = os.path.join(base_path, 'temp', job_name_out
+        # +'_out.txt')
+
+        self.r_ani = []
+
+        self.microlensing = microlensing
+        if self.microlensing:
+            self.ml_maps = []
+            self.load_microlensing_delays()
+
+        # declare following variables to populate later
+        self.model_time_delays = None
+        self.model_velocity_dispersion = None
+
+        self.powerlaw_time_delays = None
+        self.powerlaw_velocity_dispersion = None
+
+        self.composite_time_delays = None
+        self.composite_velocity_dispersion = None
+
+    def get_num_samples(self):
+        """
+        Get the number of samples.
+        :return:
+        :rtype:
+        """
+        return len(self.model_time_delays)
+
+    def combine_powerlaw_models(self, models, weights, max_sample):
+        """
+
+        :param models:
+        :type models:
+        :param weights:
+        :type weights:
+        :param num_sample: max sample from each model
+        :type num_sample:
+        :return:
+        :rtype:
+        """
+        for model, w in zip(models, weights):
+            indices = np.random.choice(np.arange(len(
+                model.model_time_delays)), int(w*max_sample))
+
+            if self.powerlaw_time_delays is None:
+                self.powerlaw_time_delays = model.model_time_delays[indices, :]
+                self.powerlaw_velocity_dispersion = model.model_velocity_dispersion[indices, :]
+                if model.r_ani != []:
+                    print(model.r_ani)
+                    self.powerlaw_rani = model.r_ani[indices]
+            else:
+                self.powerlaw_time_delays = np.append(
+                    self.powerlaw_time_delays,
+                    model.model_time_delays[indices, :],
+                    axis=0
+                )
+                self.powerlaw_velocity_dispersion = np.append(
+                    self.powerlaw_velocity_dispersion,
+                    model.model_velocity_dispersion[indices, :],
+                    axis=0
+                )
+                if model.r_ani != []:
+                    print(model.r_ani)
+                    self.powerlaw_rani = np.append(
+                        self.powerlaw_rani,
+                        model.r_ani[indices]
+                        )
+
+    def combine_composite_models(self, models, weights, max_sample):
+        """
+
+        :param models:
+        :type models:
+        :param weights:
+        :type weights:
+        :param num_sample: max sample from each model
+        :type num_sample:
+        :return:
+        :rtype:
+        """
+        for model, w in zip(models, weights):
+            indices = np.random.choice(np.arange(len(
+                model.model_time_delays)), int(w*max_sample))
+
+            if self.composite_time_delays is None:
+                self.composite_time_delays = model.model_time_delays[indices, :]
+                self.composite_velocity_dispersion = model.model_velocity_dispersion[indices, :]
+            else:
+                self.composite_time_delays = np.append(
+                    self.composite_time_delays,
+                    model.model_time_delays[indices, :],
+                    axis=0
+                )
+                self.composite_velocity_dispersion = np.append(
+                    self.composite_velocity_dispersion,
+                    model.model_velocity_dispersion[indices, :],
+                    axis=0
+                )
+
+    def combine_powerlaw_composite(self, num_sample):
+        """
+
+        :param num_sample: number of sample from each model type
+        :type num_sample:
+        :return:
+        :rtype:
+        """
+        assert num_sample <= len(self.powerlaw_time_delays) and num_sample \
+               <= len(self.composite_time_delays)
+
+        pl_indices = np.random.choice(np.arange(len(
+            self.powerlaw_time_delays)), num_sample)
+        comp_indices = np.random.choice(np.arange(len(
+            self.composite_time_delays)), num_sample)
+
+        self.model_time_delays = np.append(
+            self.powerlaw_time_delays[pl_indices, :],
+            self.composite_time_delays[comp_indices, :],
+            axis=0
+        )
+
+        self.model_velocity_dispersion = np.append(
+            self.powerlaw_velocity_dispersion[pl_indices, :],
+            self.composite_velocity_dispersion[comp_indices, :],
+            axis=0
+        )
+
+
+class Dist2Cosmology(object):
+    """
+    Class to extract cosmo posterior from distance posteriors.
+    """
+    def __init__(self, distance_posterior, z_deflector=0.597, z_source=2.375,
+                 fid_h0=70., fid_omega_m=0.3, cosmo=None):
+        """
+
+        :param z_deflector: 
+        :type z_deflector: 
+        :param z_source: 
+        :type z_source: 
+        :param distance_posterior: fiducial divided 2D array/list, order D_d,
+        D_dt
+        :type distance_posterior: 
+        """
+        self.z_l = z_deflector  # 0.745 #0.597
+        self.z_s = z_source  # 1.789 #2.375
+
+        if cosmo is not None:
+            self.cosmo_fid = cosmo
+        else:
+            self.cosmo_fid = FlatLambdaCDM(H0=fid_h0, Om0=fid_omega_m)
+
+        self.D_d_fid = self.cosmo_fid.angular_diameter_distance(self.z_l).value
+        self.D_s_fid = self.cosmo_fid.angular_diameter_distance(self.z_s).value
+        self.D_ds_fid = self.cosmo_fid.angular_diameter_distance_z1z2(self.z_l, self.z_s).value
+
+        self.D_dt_fid = (1 + self.z_l) * self.D_d_fid * self.D_s_fid / self.D_ds_fid
+
+        # in units of Mpc
+        self.physical_distance_posterior = [distance_posterior[1] *
+                                           self.D_d_fid,
+                          distance_posterior[0] * self.D_dt_fid]
+
+        self.kde_likelihood = KDELikelihood(
+            self.physical_distance_posterior[0],
+            self.physical_distance_posterior[1],
+            bandwidth=20)
+
+    def log_likelihood(self, params):
+        h0, om_m = params
+        cosmo = FlatLambdaCDM(H0=h0, Om0=om_m)
+        D_d = cosmo.angular_diameter_distance(self.z_l).value
+        D_s = cosmo.angular_diameter_distance(self.z_s).value
+        D_ds = cosmo.angular_diameter_distance_z1z2(self.z_l, self.z_s).value
+
+        D_d_r = D_d  # / D_d_fid
+        D_dt_r = (1 + self.z_l) * (D_d * D_s / D_ds)  # / D_dt_fid
+
+        return self.kde_likelihood.logLikelihood(D_d_r, D_dt_r)
+
+    def log_prior(self, params):
+        h0, om_m = params
+
+        if not 0. < h0 < 150.:
+            return -np.inf
+
+        if not 0.05 < om_m < 0.5:
+            return -np.inf
+
+        return 0.
+
+    def log_probability(self, params):
+        prior = self.log_prior(params)
+
+        if not np.isinf(prior):
+            return self.log_likelihood(params) + prior
+        else:
+            return prior
+
+    def sample_cosmo(self, nwalkers=30, burnin=1000, sample_iteration=1000):
+        # currently hard coded for fLCDM
+        ndim = 2
+        pos = np.random.normal(loc=[70., 0.3], size=[nwalkers, ndim],
+                               scale=[1, 5e-2])
+
+        sampler = emcee.EnsembleSampler(nwalkers, ndim, self.log_probability)
+        state, _, _ = sampler.run_mcmc(pos, burnin);
+
+        sampler.reset()
+        sampler.run_mcmc(state, sample_iteration);
+
+        return sampler
